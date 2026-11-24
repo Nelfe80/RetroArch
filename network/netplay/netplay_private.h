@@ -320,6 +320,11 @@ struct delta_frame
    /* The serialized state of the core at this frame, before input */
    void *state;
 
+#ifdef HAVE_BSV_MOVIE
+   /* Allocated only while recording; never part of the wire protocol. */
+   struct netplay_bsv_frame *bsv;
+#endif
+
    uint32_t frame;
 
    /* The CRC-32 of the serialized state if we've calculated it, else 0 */
@@ -686,6 +691,9 @@ struct netplay
 
    /* Host settings */
    bool allow_pausing;
+
+   /* A BSV recording is staging this frame's input queries */
+   bool bsv_capturing;
 };
 
 void video_frame_net(const void *data,

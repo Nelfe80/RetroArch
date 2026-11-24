@@ -44,6 +44,9 @@
 #include "tasks_internal.h"
 #include "../input/input_driver.h"
 #include "../input/bsv/bsvmovie.h"
+#ifdef HAVE_NETWORKING
+#include "../network/netplay/netplay.h"
+#endif
 
 #ifdef HAVE_STATESTREAM
 #if DEBUG
@@ -121,15 +124,21 @@ static bool bsv_movie_init_record(
    uint32_t state_size          = 0;
    uint32_t content_crc         = 0;
    uint32_t header[REPLAY_HEADER_LEN]  = {0};
-   intfstream_t *file           = intfstream_open_file(path,
-         RETRO_VFS_FILE_ACCESS_WRITE | RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   intfstream_t *file           = NULL;
    settings_t *settings         = config_get_ptr();
 #ifdef HAVE_STATESTREAM
    bool is_small                = false;
    uint32_t superblock_size;
    uint32_t block_size;
 #endif
+
+#ifdef HAVE_NETWORKING
+   if (!netplay_bsv_movie_init(handle))
+      return false;
+#endif
+   file = intfstream_open_file(path,
+         RETRO_VFS_FILE_ACCESS_WRITE | RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
 
    if (!file)
    {
@@ -187,7 +196,8 @@ static bool bsv_movie_init_record(
    handle->superblocks      = uint32s_index_new(superblock_size, handle->commit_interval, handle->commit_threshold);
    handle->blocks           = uint32s_index_new(block_size/4, handle->commit_interval, handle->commit_threshold);
 #endif
-   if (state_size)
+   /* Netplay writes its first confirmed state instead. */
+   if (state_size && !BSV_MOVIE_IS_NETPLAY(handle))
       return bsv_movie_reset_recording(handle);
    
    handle->min_file_pos = sizeof(header);
@@ -404,6 +414,8 @@ bool movie_stop_record(input_driver_state_t *input_st)
    const char *_msg = msg_hash_to_str(MSG_MOVIE_RECORD_STOPPED);
    if (!movie)
       return false;
+   if (movie->netplay_error)
+      RARCH_WARN("[Replay] Netplay recording stopped: %s.\n", movie->netplay_error);
    runloop_msg_queue_push(_msg, strlen(_msg), 2, 180, true, NULL,
          MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
    RARCH_LOG("[Replay] %s\n", _msg);

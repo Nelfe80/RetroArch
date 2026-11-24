@@ -244,6 +244,17 @@ struct bsv_input_data
 };
 typedef struct bsv_input_data bsv_input_data_t;
 
+#define BSV_MOVIE_MAX_INPUT_EVENTS 512
+
+enum bsv_netplay_flags
+{
+   BSV_NETPLAY_FLAG_ACTIVE    = (1 << 0),
+   BSV_NETPLAY_FLAG_ARMED     = (1 << 1),
+   BSV_NETPLAY_FLAG_COMMITTED = (1 << 2)
+};
+
+#define BSV_MOVIE_IS_NETPLAY(m) (((m)->netplay_flags & BSV_NETPLAY_FLAG_ACTIVE) != 0)
+
 struct bsv_movie
 {
    intfstream_t *file;
@@ -261,13 +272,20 @@ struct bsv_movie
    uint8_t key_event_count;
    uint16_t input_event_count;
    bsv_key_data_t key_events[128];
-   bsv_input_data_t input_events[512];
+   bsv_input_data_t input_events[BSV_MOVIE_MAX_INPUT_EVENTS];
 
    /* Rewind state */
    bool playback;
    bool first_rewind;
    bool did_rewind;
    bool checkpoint_ready;
+
+   /* Netplay stages frames until their inputs have been confirmed. */
+   const char *netplay_error;
+   size_t netplay_next_ptr;
+   uint32_t netplay_start_frame;
+   uint32_t netplay_next_frame;
+   uint8_t netplay_flags; /* enum bsv_netplay_flags */
 
 #ifdef HAVE_STATESTREAM
    /* Block index and superblock index for incremental checkpoints */
@@ -1124,6 +1142,15 @@ bool movie_start_record(input_driver_state_t *input_st, char *path);
 bool movie_stop_playback(input_driver_state_t *input_st);
 bool movie_stop_record(input_driver_state_t *input_st);
 bool movie_stop(input_driver_state_t *input_st);
+
+#ifdef HAVE_NETWORKING
+bsv_movie_t *input_driver_netplay_bsv_recording(void);
+void input_driver_netplay_bsv_stop(const char *reason, bool checkpoint_failed);
+bool input_driver_netplay_bsv_take_checkpoint(void);
+bool input_driver_netplay_bsv_next_frame(uint8_t **state, size_t *size,
+      bool forced);
+bool input_driver_bsv_stop_recording(void);
+#endif
 
 size_t replay_get_serialize_size(void);
 bool replay_get_serialized_data(void* buffer);

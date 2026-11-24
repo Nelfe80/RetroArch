@@ -337,8 +337,13 @@ bool bsv_movie_reset_playback(bsv_movie_t *handle)
    return bsv_movie_read_next_events(handle, REPLAY_CPBEHAVIOR_DESERIALIZE, true);
 }
 
-bool bsv_movie_reset_recording(bsv_movie_t *handle)
+static int64_t bsv_movie_write_checkpoint_from_state(bsv_movie_t *handle,
+      uint8_t compression, uint8_t encoding, uint8_t **state, size_t *size);
+
+static bool bsv_movie_reset_recording_internal(bsv_movie_t *handle,
+      uint8_t **state, size_t *size)
 {
+   int64_t checkpoint_size;
    size_t state_size, state_size_;
    uint8_t compression   = handle->checkpoint_compression;
 #if HAVE_STATESTREAM
@@ -358,7 +363,14 @@ bool bsv_movie_reset_recording(bsv_movie_t *handle)
    intfstream_write(handle->file, &compression, 1);
    intfstream_write(handle->file, &encoding, 1);
    handle->frame_counter = 0;
-   state_size = 2 + bsv_movie_write_checkpoint(handle, compression, encoding);
+   checkpoint_size = bsv_movie_write_checkpoint_from_state(handle,
+         compression, encoding, state, size);
+   /* NelfePlay 1.22.2 : the local path keeps its 1.22.2 behaviour (a failed
+    * initial checkpoint is still written as before); only a netplay start
+    * refuses it, as upstream does. */
+   if (checkpoint_size < 0 && state)
+      return false;
+   state_size = 2 + checkpoint_size;
    handle->min_file_pos = intfstream_tell(handle->file);
    /* Have to write initial state size header too */
    state_size_ = swap_if_big32(state_size);
@@ -366,6 +378,21 @@ bool bsv_movie_reset_recording(bsv_movie_t *handle)
    intfstream_write(handle->file, &state_size_, sizeof(uint32_t));
    intfstream_seek(handle->file, handle->min_file_pos, SEEK_SET);
    return true;
+}
+
+bool bsv_movie_reset_recording(bsv_movie_t *handle)
+{
+   return bsv_movie_reset_recording_internal(handle, NULL, NULL);
+}
+
+bool bsv_movie_reset_recording_from_state(bsv_movie_t *handle,
+      uint8_t **state, size_t *size)
+{
+   if (!state || !*state || !size || !*size ||
+         !bsv_movie_reset_recording_internal(handle, state, size))
+      return false;
+   handle->frame_pos[0] = handle->min_file_pos;
+   return intfstream_truncate(handle->file, handle->min_file_pos) == 0;
 }
 
 void bsv_movie_enqueue(input_driver_state_t *input_st,
@@ -472,6 +499,10 @@ void bsv_movie_push_key_event(bsv_movie_t *movie,
    data.mod                                  = swap_if_big16(mod);
    data.code                                 = swap_if_big32(code);
    data.character                            = swap_if_big32(character);
+   /* A frame's events are staged in fixed arrays; drop what does not
+    * fit rather than write past them. */
+   if (movie->key_event_count >= ARRAY_SIZE(movie->key_events))
+      return;
    movie->key_events[movie->key_event_count] = data;
    movie->key_event_count++;
 }
@@ -479,21 +510,25 @@ void bsv_movie_push_key_event(bsv_movie_t *movie,
 void bsv_movie_push_input_event(bsv_movie_t *movie,
      uint8_t port, uint8_t dev, uint8_t idx, uint16_t id, int16_t val)
 {
-   bsv_input_data_t data;
-   data.port                          = port;
-   data.device                        = dev;
-   data.idx                           = idx;
-   data._padding                      = 0;
-   data.id                            = swap_if_big16(id);
-   data.value                         = swap_if_big16(val);
-   movie->input_events[movie->input_event_count] = data;
-   movie->input_event_count++;
+   bsv_input_data_t *data;
+   if (movie->input_event_count >= ARRAY_SIZE(movie->input_events))
+      return;
+   data           = &movie->input_events[movie->input_event_count++];
+   data->port     = port;
+   data->device   = dev;
+   data->idx      = idx;
+   data->_padding = 0;
+   data->id       = swap_if_big16(id);
+   data->value    = swap_if_big16(val);
 }
 
 bool bsv_movie_handle_read_input_event(bsv_movie_t *movie,
      uint8_t port, uint8_t dev, uint8_t idx, uint16_t id, int16_t* val)
 {
    int i;
+   /* Events hold their id little-endian: convert the query once
+    * rather than every event it is compared against. */
+   uint16_t id_le = swap_if_big16(id);
    /* if movie is old, just read two bytes and hope for the best */
    if (movie->version == 0)
    {
@@ -503,13 +538,14 @@ bool bsv_movie_handle_read_input_event(bsv_movie_t *movie,
    }
    for (i = 0; i < movie->input_event_count; i++)
    {
-      bsv_input_data_t evt = movie->input_events[i];
-      if (   (evt.port   == port)
-          && (evt.device == dev)
-          && (evt.idx    == idx)
-          && (evt.id     == id))
+      const bsv_input_data_t *evt = &movie->input_events[i];
+      /* id first: it is what differs most between a frame's events */
+      if (   (evt->id     == id_le)
+          && (evt->port   == port)
+          && (evt->device == dev)
+          && (evt->idx    == idx))
       {
-         *val = swap_if_big16(evt.value);
+         *val = swap_if_big16(evt->value);
          return true;
       }
    }
@@ -666,7 +702,11 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
    return ret;
 }
 
-int64_t bsv_movie_write_checkpoint(bsv_movie_t *handle, uint8_t compression, uint8_t encoding)
+/* With @state, the caller's buffer of *@size bytes holds the state and
+ * is taken as the checkpoint's own rather than copied: the caller is
+ * handed back the buffer it replaces, NULL or its own to free. */
+static int64_t bsv_movie_write_checkpoint_from_state(bsv_movie_t *handle,
+      uint8_t compression, uint8_t encoding, uint8_t **state, size_t *size)
 {
    uint8_t *swap;
    size_t size_swap;
@@ -675,20 +715,37 @@ int64_t bsv_movie_write_checkpoint(bsv_movie_t *handle, uint8_t compression, uin
    uint8_t *encoded_data = NULL, *compressed_encoded_data = NULL;
    bool owns_encoded = false, owns_compressed_encoded = false;
    retro_ctx_serialize_info_t serial_info;
-   serial_info.size = core_serialize_size();
-   if (handle->cur_save_size < serial_info.size)
+   if (state && *state)
    {
-      free(handle->cur_save);
-      handle->cur_save = NULL;
+      uint8_t *lent    = *state;
+      size_t lent_size = *size;
+      if (!handle->cur_save || handle->cur_save_size < lent_size)
+         handle->cur_save_valid = false;
+      *state                = handle->cur_save;
+      *size                 = handle->cur_save ? handle->cur_save_size : 0;
+      handle->cur_save      = lent;
+      handle->cur_save_size = lent_size;
+      serial_info.data      = lent;
+      serial_info.size      = lent_size;
    }
-   if (!handle->cur_save)
+   else
    {
-      handle->cur_save_size  = serial_info.size;
-      handle->cur_save       = (uint8_t*)malloc(serial_info.size);
-      handle->cur_save_valid = false;
+      /* 1.22.2 local path, unchanged */
+      serial_info.size = core_serialize_size();
+      if (handle->cur_save_size < serial_info.size)
+      {
+         free(handle->cur_save);
+         handle->cur_save = NULL;
+      }
+      if (!handle->cur_save)
+      {
+         handle->cur_save_size  = serial_info.size;
+         handle->cur_save       = (uint8_t*)malloc(serial_info.size);
+         handle->cur_save_valid = false;
+      }
+      serial_info.data = handle->cur_save;
+      core_serialize(&serial_info);
    }
-   serial_info.data = handle->cur_save;
-   core_serialize(&serial_info);
    switch (encoding)
    {
       case REPLAY_CHECKPOINT2_ENCODING_RAW:
@@ -795,6 +852,13 @@ exit:
    if (compressed_encoded_data && owns_compressed_encoded)
       free(compressed_encoded_data);
    return ret;
+}
+
+int64_t bsv_movie_write_checkpoint(bsv_movie_t *handle,
+      uint8_t compression, uint8_t encoding)
+{
+   return bsv_movie_write_checkpoint_from_state(handle,
+         compression, encoding, NULL, NULL);
 }
 
 bool bsv_movie_read_next_events(bsv_movie_t *handle,
@@ -965,10 +1029,10 @@ void bsv_movie_scan_from_start(bsv_movie_t *movie, int32_t len)
    bsv_movie_scan_to(movie, len);
 }
 
-void bsv_movie_next_frame(input_driver_state_t *input_st)
+static void bsv_movie_next_frame_internal(input_driver_state_t *input_st,
+      unsigned checkpoint_interval, bool checkpoint_deserialize,
+      bool external_state, uint8_t **state, size_t *size)
 {
-   unsigned checkpoint_interval   = config_get_ptr()->uints.replay_checkpoint_interval;
-   unsigned checkpoint_deserialize= config_get_ptr()->bools.replay_checkpoint_deserialize;
    /* If bsv_movie_state_next_handle is not NULL, deinit and set
       bsv_movie_state_handle to bsv_movie_state_next_handle and clear
       next_handle */
@@ -1014,10 +1078,11 @@ void bsv_movie_next_frame(input_driver_state_t *input_st)
       handle->input_event_count = 0;
 
       /* Maybe record checkpoint */
-      if (     (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_FORCE_CHECKPOINT)
+      if (external_state ? (state && *state) :
+            ((input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_FORCE_CHECKPOINT)
             || ((checkpoint_interval != 0)
             && (handle->frame_counter > 0)
-            && (handle->frame_counter % (checkpoint_interval*60) == 0)))
+            && (handle->frame_counter % (checkpoint_interval*60) == 0))))
       {
          uint8_t frame_tok   = REPLAY_TOKEN_CHECKPOINT2_FRAME;
          uint8_t compression = handle->checkpoint_compression;
@@ -1026,15 +1091,18 @@ void bsv_movie_next_frame(input_driver_state_t *input_st)
 #else
          uint8_t encoding    = REPLAY_CHECKPOINT2_ENCODING_RAW;
 #endif
-         input_st->bsv_movie_state.flags &= ~BSV_FLAG_MOVIE_FORCE_CHECKPOINT;
+         if (!external_state)
+            input_st->bsv_movie_state.flags &= ~BSV_FLAG_MOVIE_FORCE_CHECKPOINT;
          /* "next frame is a checkpoint" */
          intfstream_write(handle->file, (uint8_t *)(&frame_tok), sizeof(uint8_t));
          /* compression and encoding schemes */
          intfstream_write(handle->file, (uint8_t *)(&compression), sizeof(uint8_t));
          intfstream_write(handle->file, (uint8_t *)(&encoding), sizeof(uint8_t));
-         if (bsv_movie_write_checkpoint(handle, compression, encoding) < 0)
+         if (bsv_movie_write_checkpoint_from_state(handle,
+                  compression, encoding, state, size) < 0)
          {
-            RARCH_ERR("[Replay] failed to write checkpoint, exiting record\n");
+            if (!external_state)
+               RARCH_ERR("[Replay] failed to write checkpoint, exiting record\n");
             input_st->bsv_movie_state.flags |= BSV_FLAG_MOVIE_END;
          }
       }
@@ -1111,9 +1179,27 @@ void bsv_movie_next_frame(input_driver_state_t *input_st)
    }
 }
 
+void bsv_movie_next_frame(input_driver_state_t *input_st)
+{
+   settings_t *settings = config_get_ptr();
+   bsv_movie_next_frame_internal(input_st,
+         settings->uints.replay_checkpoint_interval,
+         settings->bools.replay_checkpoint_deserialize, false, NULL, NULL);
+}
+
+void bsv_movie_next_frame_from_state(input_driver_state_t *input_st,
+      uint8_t **state, size_t *size)
+{
+   bsv_movie_next_frame_internal(input_st, 0, false, true, state, size);
+}
+
 size_t replay_get_serialize_size(void)
 {
    input_driver_state_t *input_st = input_state_get_ptr();
+   /* A netplay movie lags the core by its unconfirmed frames. */
+   if (     input_st->bsv_movie_state_handle
+         && BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
+      return 0;
    if (input_st->bsv_movie_state.flags & (BSV_FLAG_MOVIE_RECORDING | BSV_FLAG_MOVIE_PLAYBACK))
       return sizeof(int32_t)+intfstream_tell(input_st->bsv_movie_state_handle->file);
    return 0;
@@ -1124,6 +1210,8 @@ bool replay_get_serialized_data(void* buffer)
    input_driver_state_t *input_st = input_state_get_ptr();
    bsv_movie_t *handle            = input_st->bsv_movie_state_handle;
 
+   if (handle && BSV_MOVIE_IS_NETPLAY(handle))
+      return false;
    if (input_st->bsv_movie_state.flags & (BSV_FLAG_MOVIE_RECORDING | BSV_FLAG_MOVIE_PLAYBACK))
    {
       int32_t file_end        = (uint32_t)intfstream_tell(handle->file);
@@ -1472,15 +1560,14 @@ void bsv_movie_poll(input_driver_state_t *input_st)
    if (*key_event && *key_event == runloop_st->frontend_key_event)
    {
       int i;
-      bsv_key_data_t k;
       for (i = 0; i < handle->key_event_count; i++)
       {
+         const bsv_key_data_t *k = &handle->key_events[i];
 #ifdef HAVE_CHEEVOS
          rcheevos_pause_hardcore();
 #endif
-         k = handle->key_events[i];
-         input_keyboard_event(k.down, swap_if_big32(k.code),
-               swap_if_big32(k.character), swap_if_big16(k.mod),
+         input_keyboard_event(k->down, swap_if_big32(k->code),
+               swap_if_big32(k->character), swap_if_big16(k->mod),
                RETRO_DEVICE_KEYBOARD);
       }
       /* Have to clear here so we don't double-apply key events */
@@ -1854,7 +1941,8 @@ bool movie_commit_checkpoint(input_driver_state_t *input_st)
 
 bool movie_seek_to_frame(input_driver_state_t *input_st, int64_t frame)
 {
-   if (!input_st->bsv_movie_state_handle)
+   if (!input_st->bsv_movie_state_handle
+         || BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
       return false;
 #ifdef HAVE_CHEEVOS
    if (rcheevos_hardcore_active())
@@ -1875,7 +1963,8 @@ bool movie_skip_to_next_checkpoint(input_driver_state_t *input_st)
    /* Can't skip forward in an unpaused recording replay. */
    if (      !input_st->bsv_movie_state_handle
          || (!input_st->bsv_movie_state_handle->playback && !paused)
-         || input_st->bsv_movie_state_handle->version == 0)
+         || input_st->bsv_movie_state_handle->version == 0
+         || BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
       return false;
 #ifdef HAVE_CHEEVOS
    if (rcheevos_hardcore_active())
@@ -1888,7 +1977,8 @@ bool movie_skip_to_next_checkpoint(input_driver_state_t *input_st)
 bool movie_skip_to_prev_checkpoint(input_driver_state_t *input_st)
 {
    if (  !input_st->bsv_movie_state_handle
-       || input_st->bsv_movie_state_handle->version == 0)
+       || input_st->bsv_movie_state_handle->version == 0
+       || BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
       return false;
 #ifdef HAVE_CHEEVOS
    if (rcheevos_hardcore_active())

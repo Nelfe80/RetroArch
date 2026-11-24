@@ -7421,11 +7421,23 @@ int runloop_iterate(void)
    presence_update(PRESENCE_GAME);
 #endif
 #ifdef HAVE_BSV_MOVIE
-   bsv_movie_next_frame(input_st);
-   if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END)
+   if (     input_st->bsv_movie_state_handle
+         && BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
    {
-      movie_stop_playback(input_st);
-      command_event(CMD_EVENT_PAUSE, NULL);
+      /* Netplay writes its frames once they are confirmed; an ended
+       * netplay recording is stopped here, outside the netplay
+       * callbacks, and the game goes on. */
+      if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END)
+         movie_stop(input_st);
+   }
+   else
+   {
+      bsv_movie_next_frame(input_st);
+      if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END)
+      {
+         movie_stop_playback(input_st);
+         command_event(CMD_EVENT_PAUSE, NULL);
+      }
    }
 #endif
 

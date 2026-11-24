@@ -6502,7 +6502,8 @@ int16_t input_driver_state_wrapper(unsigned port, unsigned device,
       input_st->analog_requested[port] = true;
 
 #ifdef HAVE_BSV_MOVIE
-   if (BSV_MOVIE_IS_RECORDING())
+   if (BSV_MOVIE_IS_RECORDING()
+         && !BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
 #ifdef HAVE_REWIND
       if (!state_manager_frame_is_reversed())
 #endif
@@ -7335,7 +7336,8 @@ void input_keyboard_event(bool down, unsigned code,
          if (*key_event == runloop_st->frontend_key_event)
          {
 #ifdef HAVE_BSV_MOVIE
-            if (BSV_MOVIE_IS_RECORDING())
+            if (BSV_MOVIE_IS_RECORDING()
+                  && !BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
 #ifdef HAVE_REWIND
                if (!state_manager_frame_is_reversed())
 #endif
@@ -7348,3 +7350,59 @@ void input_keyboard_event(bool down, unsigned code,
       }
    }
 }
+
+#if defined(HAVE_BSV_MOVIE) && defined(HAVE_NETWORKING)
+/* ===== BEGIN netplay BSV frontend (0afe7f41d1, 235c50847b) ===== */
+bsv_movie_t *input_driver_netplay_bsv_recording(void)
+{
+   bsv_movie_t *movie = input_driver_st.bsv_movie_state_handle;
+   uint16_t flags = input_driver_st.bsv_movie_state.flags;
+   if (   movie && BSV_MOVIE_IS_NETPLAY(movie)
+       && (flags & BSV_FLAG_MOVIE_RECORDING)
+       && !(flags & BSV_FLAG_MOVIE_END))
+      return movie;
+   return NULL;
+}
+
+void input_driver_netplay_bsv_stop(const char *reason, bool checkpoint_failed)
+{
+   bsv_movie_t *movie = input_driver_st.bsv_movie_state_handle;
+   if (!movie)
+      movie = input_driver_st.bsv_movie_state_next_handle;
+   if (movie && BSV_MOVIE_IS_NETPLAY(movie))
+   {
+      /* Finish outside the netplay synchronization callback. */
+      movie->netplay_error = reason;
+      input_driver_st.bsv_movie_state.flags |= BSV_FLAG_MOVIE_END;
+      if (checkpoint_failed)
+         RARCH_ERR("[Replay] Failed to capture the netplay checkpoint.\n");
+   }
+}
+
+bool input_driver_netplay_bsv_take_checkpoint(void)
+{
+   if (!(input_driver_st.bsv_movie_state.flags & BSV_FLAG_MOVIE_FORCE_CHECKPOINT))
+      return false;
+   input_driver_st.bsv_movie_state.flags &= ~BSV_FLAG_MOVIE_FORCE_CHECKPOINT;
+   return true;
+}
+
+bool input_driver_netplay_bsv_next_frame(uint8_t **state, size_t *size,
+      bool forced)
+{
+   bool success;
+   bsv_movie_next_frame_from_state(&input_driver_st, state, size);
+   success = !(input_driver_st.bsv_movie_state.flags & BSV_FLAG_MOVIE_END);
+   if (forced && !success)
+      RARCH_ERR("[Replay] Failed to write the netplay checkpoint.\n");
+   return success;
+}
+
+bool input_driver_bsv_stop_recording(void)
+{
+   if (!(input_driver_st.bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING))
+      return false;
+   return movie_stop_record(&input_driver_st);
+}
+/* ===== END netplay BSV frontend ===== */
+#endif
